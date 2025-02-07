@@ -44,6 +44,7 @@ from transformers.utils import is_peft_available
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..import_utils import is_vllm_available
+from ..import_utils import is_ray_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
@@ -55,6 +56,10 @@ if is_peft_available():
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
+
+if is_ray_available():
+    import ray
+    import ray.util.collective as collective
 
 if is_wandb_available():
     import wandb
@@ -340,7 +345,36 @@ class GRPOTrainer(Trainer):
                     "`pip install vllm` to use it."
                 )
 
-            if self.accelerator.is_main_process:
+            if not is_ray_available():
+                raise ImportError(
+                    "ray is not available and `use_ray` is set to True. Please install ray and supporting nccl/cupy libraries with "
+                    "`pip install ray` to use it."
+                )
+
+            if self.use_ray:
+                vllm_devices = [int(device_id) for device_id in self.args.vllm_device.split(',')]
+                from vllm_engine import VLLMEngineManager
+                # Run this on the trainer (rank 0)
+                collective.init_collective_group(
+                    world_size=len(vllm_devices) + 1, # Assume trainer occupies rank 0
+                    rank=0,
+                    backend="nccl",
+                    group_name="trl_group"
+                )
+                manager = VLLMEngineManager.remote(
+                    model_path=model.name_or_path,
+                    num_engines=len(vllm_devices),
+                    gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                    dtype=self.args.vllm_dtype,
+                    enable_prefix_caching=True,
+                    max_model_len=self.args.vllm_max_model_len,
+                )
+
+                # Obtain engine instances after Ray initializes them
+                engines = ray.get(manager.get_engines.remote())
+                print(f"Launched {len(self.engines)} vllm instances of {self.model_path}")
+
+            elif self.accelerator.is_main_process:
                 vllm_device = self.args.vllm_device
                 if vllm_device == "auto":
                     vllm_device = f"cuda:{self.accelerator.num_processes}"  # take the next GPU idx
@@ -453,8 +487,13 @@ class GRPOTrainer(Trainer):
             else:
                 state_dict = unwrapped_model.state_dict()
         if self.accelerator.is_main_process:
-            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-            llm_model.load_weights(state_dict.items())
+            if self.use_ray:
+                # Call update weights on each engine instance, which broadcasts layers from rank 0 to vllm engine actors
+                self.engine_manager.update_weights(state_dict.keys()).remote()
+                pass
+            else:
+                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                llm_model.load_weights(state_dict.items())
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
@@ -479,7 +518,10 @@ class GRPOTrainer(Trainer):
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
-            if self.accelerator.is_main_process:
+            if self.use_ray:
+                outputs = self.vllm_engines.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+            elif self.accelerator.is_main_process:
                 outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
                 completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
