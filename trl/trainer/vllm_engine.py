@@ -10,7 +10,7 @@ import torch
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_gpus=1, resources={"trl_vllm_engine": 1})
 class VLLMEngineActor:
     def __init__(self, *args, **kwargs):
         import vllm
@@ -20,8 +20,12 @@ class VLLMEngineActor:
 
         noset_visible_devices = kwargs.pop("noset_visible_devices", False)
         group_name = kwargs.pop("group_name", "dummy_group")
+        trainer_address = kwargs.pop("trainer_address", "127.0.0.1")
         self.use_gpu_executor = kwargs["tensor_parallel_size"] == 1 and not noset_visible_devices
         # self.use_gpu_executor = kwargs["tensor_parallel_size"] == 1
+
+        # vLLM engine should join the trainer's cluster
+        ray.init(address=trainer_address)
 
         # See https://github.com/vllm-project/vllm/blob/main/vllm/executor/gpu_executor.py
         if self.use_gpu_executor:
@@ -50,7 +54,7 @@ class VLLMEngineActor:
         self.llm = vllm.LLM(*args, **kwargs)
 
         self.init_process_group(
-            master_address="127.0.0.1",
+            master_address=trainer_address,
             master_port=29500,
             rank_offset=0,
             world_size=kwargs["tensor_parallel_size"],
@@ -186,7 +190,7 @@ class VLLMEngineManager:
         import ray.util.collective as collective
 
         self.model_path = model_path
-        #  Start VLLMEngineActors on rank 1-4 for testing 
+
         self.engines = create_vllm_engines(
             model_path=self.model_path,
             num_engines=num_engines,
@@ -229,9 +233,7 @@ if __name__ == "__main__":
         model_path="/original_models/Qwen2.5-Coder-3B-Instruct",
         num_engines=2
     )
-    engines = ray.get(manager.get_engines.remote())
-
-    engines[0].generate.remote("San Franciso is a")
+    completions = ray.get(manager.generate.remote(["San Franciso is a", "Toronto is a", "Kingston is a", "Hong Kong is a"]))
 
     # print(f"Got named parameters for engine 0 {engines[0].remote().named_parameters.keys()}")
 
@@ -249,11 +251,13 @@ if __name__ == "__main__":
     #         )
 
 
-    engines[0].update_weight.remote(
-        layers_and_shapes= { "model.norm.weight": torch.Size([2048]) },
-        dtype=torch.bfloat16,
-        empty_cache=False
-    )
+    # engines[0].update_weight.remote(
+    #     layers_and_shapes= { "model.norm.weight": torch.Size([2048]) },
+    #     dtype=torch.bfloat16,
+    #     empty_cache=False
+    # )
+
+    print(completions)
 
     while True:
         pass

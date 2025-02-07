@@ -165,6 +165,14 @@ class GRPOConfig(TrainingArguments):
             "(`pip install vllm`)."
         },
     )
+    use_ray: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Whether to use ray + vLLM for generating completions. If set to `True`, ensure NUM_TRL_VLLM_ENGINES is specified "
+            "and the vLLM actors are started alongside the trainer, with the trainer IP as head node. "
+            "(`pip install ray`)."
+        },
+    )
     vllm_device: Optional[str] = field(
         default="auto",
         metadata={

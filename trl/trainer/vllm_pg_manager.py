@@ -41,8 +41,6 @@ class WorkerWrap(Worker):
 
         import ray.util.collective as collective
         collective.broadcast(weight, 0, group_name=self._model_update_group)
-
-        print("+++++++++++++++")
         # The layer names have "model." prepended when getting from self.model_runner.model.named_parameters()
         # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2.py#L363
         params = list(self.model_runner.model.named_parameters(remove_duplicate=True))

@@ -61,6 +61,8 @@ if is_ray_available():
     import ray
     import ray.util.collective as collective
 
+    ray.init(address="auto")
+
 if is_wandb_available():
     import wandb
 
@@ -292,6 +294,7 @@ class GRPOTrainer(Trainer):
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.use_vllm = args.use_vllm
+        self.use_ray = args.use_ray
 
         self.beta = args.beta
 
@@ -352,18 +355,21 @@ class GRPOTrainer(Trainer):
                 )
 
             if self.use_ray:
-                vllm_devices = [int(device_id) for device_id in self.args.vllm_device.split(',')]
+                print(f"=============== USING RAY ============================")
+                # vLLM actors must be started after the trainer process, each vLLM actor may only start on nodes with a specified resource "trl_vllm_engine"
+                num_vllm_engines = os.environ.get("NUM_TRL_VLLM_ENGINES", 1)
                 from vllm_engine import VLLMEngineManager
-                # Run this on the trainer (rank 0)
+                # Run this on the trainer (rank 0 of cyber-4)
                 collective.init_collective_group(
-                    world_size=len(vllm_devices) + 1, # Assume trainer occupies rank 0
+                    world_size=num_vllm_engines + 1, # Assume trainer occupies rank 0
                     rank=0,
                     backend="nccl",
                     group_name="trl_group"
                 )
+                # Run this on the vllm workers (rank 1-4 of cyber-2)
                 manager = VLLMEngineManager.remote(
                     model_path=model.name_or_path,
-                    num_engines=len(vllm_devices),
+                    num_engines=num_vllm_engines,
                     group_name="trl_group",
                     gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
                     dtype=self.args.vllm_dtype,
