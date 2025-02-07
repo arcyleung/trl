@@ -364,15 +364,16 @@ class GRPOTrainer(Trainer):
                 manager = VLLMEngineManager.remote(
                     model_path=model.name_or_path,
                     num_engines=len(vllm_devices),
+                    group_name="trl_group",
                     gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
                     dtype=self.args.vllm_dtype,
                     enable_prefix_caching=True,
                     max_model_len=self.args.vllm_max_model_len,
                 )
 
-                # Obtain engine instances after Ray initializes them
-                engines = ray.get(manager.get_engines.remote())
-                print(f"Launched {len(self.engines)} vllm instances of {self.model_path}")
+                # Obtain individual VLLMEngineActor instances after Ray initializes them
+                self.vllm_engines = ray.get(manager.get_engines.remote())
+                print(f"Launched {len(self.vllm_engines)} vllm instances of {self.model_path}")
 
             elif self.accelerator.is_main_process:
                 vllm_device = self.args.vllm_device
@@ -488,9 +489,13 @@ class GRPOTrainer(Trainer):
                 state_dict = unwrapped_model.state_dict()
         if self.accelerator.is_main_process:
             if self.use_ray:
-                # Call update weights on each engine instance, which broadcasts layers from rank 0 to vllm engine actors
-                self.engine_manager.update_weights(state_dict.keys()).remote()
-                pass
+                layers_and_shapes = {name: tensor.shape for name, tensor in state_dict.items()}
+                # Call update_weights on each engine instance, which broadcasts layers from rank 0 to vllm engine actors
+                self.engine_manager.update_weights.remote(
+                    layers_and_shapes=layers_and_shapes,
+                    dtype=self.args.vllm_dtype,
+                    empty_cache=False
+                )
             else:
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights(state_dict.items())
@@ -518,12 +523,18 @@ class GRPOTrainer(Trainer):
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
-            if self.use_ray:
-                outputs = self.vllm_engines.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
-            elif self.accelerator.is_main_process:
-                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+            
+            if self.accelerator.is_main_process:
+                if self.use_ray:
+                    outputs = self.vllm_manager.generate(
+                        all_prompts_text,
+                        sampling_params=self.sampling_params,
+                        use_tqdm=False
+                    )
+                    completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                else:
+                    outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+                    completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
                 completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its

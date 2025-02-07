@@ -6,11 +6,12 @@
 # Please refer to the original repositories for the source implementations.
 import os
 import ray
+import torch
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 @ray.remote(num_gpus=1)
-class VLLMActor:
+class VLLMEngineActor:
     def __init__(self, *args, **kwargs):
         import vllm
         import os
@@ -18,6 +19,7 @@ class VLLMActor:
         self.__version__ = vllm.__version__
 
         noset_visible_devices = kwargs.pop("noset_visible_devices", False)
+        group_name = kwargs.pop("group_name", "dummy_group")
         self.use_gpu_executor = kwargs["tensor_parallel_size"] == 1 and not noset_visible_devices
         # self.use_gpu_executor = kwargs["tensor_parallel_size"] == 1
 
@@ -52,7 +54,7 @@ class VLLMActor:
             master_port=29500,
             rank_offset=0,
             world_size=kwargs["tensor_parallel_size"],
-            group_name="dummy_group",
+            group_name=group_name,
             backend="nccl",
             use_ray=not self.use_gpu_executor
         )
@@ -70,13 +72,14 @@ class VLLMActor:
                 "init_process_group", master_address, master_port, rank_offset, world_size, group_name, backend, use_ray
             )
 
-    def update_weight(self, name, dtype, shape, empty_cache=False):
+    def update_weight(self, layers_and_shapes, dtype, empty_cache=False):
         self.stop_remote_worker_execution_loop()
 
-        if self.use_gpu_executor:
-            return self.llm.llm_engine.model_executor.driver_worker.update_weight(name, dtype, shape, empty_cache)
-        else:
-            return self.llm.llm_engine.model_executor._run_workers("update_weight", name, dtype, shape, empty_cache)
+        for layer, shape in layers_and_shapes.items():
+            if self.use_gpu_executor:
+                return self.llm.llm_engine.model_executor.driver_worker.update_weight(layer, dtype, shape, empty_cache)
+            else:
+                return self.llm.llm_engine.model_executor._run_workers("update_weight", layer, dtype, shape, empty_cache)
 
     def stop_remote_worker_execution_loop(self):
         # Fix error for using 2 communication group
@@ -114,11 +117,15 @@ def ray_noset_visible_devices(env_vars=os.environ):
 def create_vllm_engines(
     model_path: str,
     num_engines: int,
-    tensor_parallel_size: int,
-    seed: int,
-    enable_prefix_caching: bool,
-    enforce_eager: bool,
-    max_model_len: int,
+    tensor_parallel_size: int = 1,
+    group_name="dummy_group",
+    gpu_memory_utilization=0.9,
+    dtype=torch.bfloat16,
+    seed=98,
+    enable_prefix_caching:bool = True,
+    enforce_eager: bool = True,
+    max_model_len: int = 32768,
+
 ):
     vllm_engines = []
     # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES will always be set in current context,
@@ -141,7 +148,7 @@ def create_vllm_engines(
             )
 
         vllm_engines.append(
-            VLLMActor.options(
+            VLLMEngineActor.options(
                 num_cpus=1,
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
@@ -150,8 +157,10 @@ def create_vllm_engines(
                 noset_visible_devices=noset_visible_devices,
                 trust_remote_code=True,
                 tensor_parallel_size=tensor_parallel_size,
-                dtype="bfloat16",
+                group_name=group_name,
+                dtype=dtype,
                 seed=seed + i,
+                gpu_memory_utilization=gpu_memory_utilization,
                 enable_prefix_caching=enable_prefix_caching,
                 enforce_eager=enforce_eager,
                 max_model_len=max_model_len,
@@ -160,42 +169,65 @@ def create_vllm_engines(
 
     return vllm_engines
 
+@ray.remote
 class VLLMEngineManager:
     engines = []
     def __init__(
             self,
             model_path,
             num_engines,
-            group_name="dummy_group"
+            group_name="dummy_group",
+            gpu_memory_utilization=0.9,
+            dtype=torch.bfloat16,
+            enable_prefix_caching=True,
+            max_model_len=32768,
         ):
 
         import ray.util.collective as collective
 
         self.model_path = model_path
-        #  Start VLLMActors on rank 1-4 for testing 
+        #  Start VLLMEngineActors on rank 1-4 for testing 
         self.engines = create_vllm_engines(
             model_path=self.model_path,
             num_engines=num_engines,
+            group_name=group_name,
             tensor_parallel_size=1,
+            gpu_memory_utilization=gpu_memory_utilization,
             seed=98,
-            enable_prefix_caching=True,
+            dtype=dtype,
+            enable_prefix_caching=enable_prefix_caching,
             enforce_eager=True,
-            max_model_len=32000
+            max_model_len=max_model_len
         )
         print(f"Launched {len(self.engines)} vllm instances of {self.model_path}")
 
-    def update_weights(self, layers):
-        for 
+    def update_weights(self, layers_and_shapes):
+        for engine in self.engines:
+            engine.update_weight.remote(
+                layers_and_shapes=layers_and_shapes,
+                dtype=self.dtype,
+                empty_cache=False
+            )
+
+    def generate(self, prompts):
+        # Equal balance over each engine instance
+        distributed_prompts = [prompts[i::len(self.engines)] for i in range(len(self.engines))]
+        generation_tasks = [engine.generate.remote(prompt) for engine, prompt in zip(self.engines, distributed_prompts)]
+
+        # Wait for all engines to finish
+        results = ray.get(generation_tasks)
+
+        return results
 
     def get_engines(self):
         return self.engines
 
 if __name__ == "__main__":
     import torch
-
+    # Testing with Qwen
     manager = VLLMEngineManager.remote(
         model_path="/original_models/Qwen2.5-Coder-3B-Instruct",
-        num_engines=6
+        num_engines=2
     )
     engines = ray.get(manager.get_engines.remote())
 
@@ -218,9 +250,8 @@ if __name__ == "__main__":
 
 
     engines[0].update_weight.remote(
-        name="model.norm.weight",
+        layers_and_shapes= { "model.norm.weight": torch.Size([2048]) },
         dtype=torch.bfloat16,
-        shape=(2048),
         empty_cache=False
     )
 
