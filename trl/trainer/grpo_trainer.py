@@ -28,7 +28,7 @@ from datasets import Dataset, IterableDataset
 from packaging import version
 from torch import nn
 from torch.utils.data import Sampler
-from extras.best_of_n_sampler import BestOfNSampler
+from ..extras.best_of_n_sampler import BestOfNSampler
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
@@ -192,8 +192,8 @@ class GRPOTrainer(Trainer):
             model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
         peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
-        generation_per_sample (int, *optional*, defaults to `1`):
-            The number of generations per sample to obtain best of n, where n = num_generations * generation_per_sample. Enables best of n sampling when generation_per_sample > 1.
+        generations_per_sample (int, *optional*, defaults to `1`):
+            The number of generations per sample to obtain best of n, where n = num_generations * generations_per_sample. Enables best of n sampling when generations_per_sample > 1.
     """
 
     _tag_names = ["trl", "grpo"]
@@ -210,7 +210,7 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
-        generation_per_sample: Optional[int] = 1
+        generations_per_sample: Optional[int] = 1
     ):
         # Args
         if args is None:
@@ -317,7 +317,7 @@ class GRPOTrainer(Trainer):
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.use_vllm = args.use_vllm
 
-        self.generation_per_sample = generation_per_sample
+        self.generations_per_sample = generations_per_sample
 
         self.beta = args.beta
 
@@ -523,11 +523,11 @@ class GRPOTrainer(Trainer):
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs] * self.generations_per_sample
         prompt_inputs = self.processing_class(
             prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs) * self.generation_per_sample
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         if self.max_prompt_length is not None:
@@ -545,8 +545,8 @@ class GRPOTrainer(Trainer):
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
                 outputs = self.llm.generate(
-                    all_prompts_text, 
-                    sampling_params=self.sampling_params, 
+                    all_prompts_text,
+                    sampling_params=self.sampling_params,
                     use_tqdm=False
                 )
                 completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
@@ -577,15 +577,17 @@ class GRPOTrainer(Trainer):
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
-            if self.generation_per_sample > 1:
+            if self.generations_per_sample > 1:
+                print(f"++++++++++ Selecting Best of {len(completion_ids)} ++++++++++++ ")
                 completions_text_with_extra = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
                 # Get best of N results
                 bon_sampler = BestOfNSampler(queries_to_scores=self.reward_funcs[0], n_candidates=self.num_generations)
                 bon_results = bon_sampler.select_best(completions_text_with_extra)
-                
+
                 # Filter completion_ids to only keep the best ones
                 best_indices = [i for i, comp in enumerate(completions_text_with_extra) if comp in bon_results[0]]
+                print(f"++++++++++ best_indices of {best_indices} ++++++++++++ ")
                 completion_ids = completion_ids[best_indices]
                 prompt_ids = prompt_ids[best_indices]
                 prompt_mask = prompt_mask[best_indices]

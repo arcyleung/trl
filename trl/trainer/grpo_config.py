@@ -47,6 +47,8 @@ class GRPOConfig(TrainingArguments):
         num_generations (`int` or `None`, *optional*, defaults to `8`):
             Number of generations per prompt to sample. The global batch size (num_processes * per_device_batch_size)
             must be divisible by this value.
+        generations_per_sample (`int` or `None`, *optional*, defaults to `1`):
+            Number of generations per sample to obtain best of n. Ex. For num_generations=4 and generations_per_sample=2, a total of 8 completions will be evaluated by the bon sampler and top 4 are returned to update the policy model.
         temperature (`float`, *optional*, defaults to `0.9`):
             Temperature for sampling. The higher the temperature, the more random the completions.
         max_completion_length (`int` or `None`, *optional*, defaults to `256`):
@@ -140,6 +142,12 @@ class GRPOConfig(TrainingArguments):
         metadata={
             "help": "Number of generations to sample. The global batch size (num_processes * per_device_batch_size) "
             "must be divisible by this value."
+        },
+    )
+    generations_per_sample: Optional[int] = field(
+        default=1,
+        metadata={
+            "help": "Number of generations per sample to obtain best of n. Ex. For num_generations=4 and generations_per_sample=2, a total of 8 completions will be evaluated by the bon sampler and top 4 are returned to update the policy model."
         },
     )
     temperature: Optional[float] = field(
