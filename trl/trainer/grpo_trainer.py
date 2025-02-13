@@ -28,6 +28,7 @@ from datasets import Dataset, IterableDataset
 from packaging import version
 from torch import nn
 from torch.utils.data import Sampler
+from extras.best_of_n_sampler import BestOfNSampler
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForSequenceClassification,
@@ -191,6 +192,8 @@ class GRPOTrainer(Trainer):
             model and a scheduler given by [`get_linear_schedule_with_warmup`] controlled by `args`.
         peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
+        generation_per_sample (int, *optional*, defaults to `1`):
+            The number of generations per sample to obtain best of n, where n = num_generations * generation_per_sample. Enables best of n sampling when generation_per_sample > 1.
     """
 
     _tag_names = ["trl", "grpo"]
@@ -207,6 +210,7 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        generation_per_sample: Optional[int] = 1
     ):
         # Args
         if args is None:
@@ -312,6 +316,8 @@ class GRPOTrainer(Trainer):
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.use_vllm = args.use_vllm
+
+        self.generation_per_sample = generation_per_sample
 
         self.beta = args.beta
 
@@ -519,7 +525,7 @@ class GRPOTrainer(Trainer):
         prompt_inputs = self.processing_class(
             prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_inputs = super()._prepare_inputs(prompt_inputs) * self.generation_per_sample
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         if self.max_prompt_length is not None:
@@ -536,7 +542,11 @@ class GRPOTrainer(Trainer):
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
-                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+                outputs = self.llm.generate(
+                    all_prompts_text, 
+                    sampling_params=self.sampling_params, 
+                    use_tqdm=False
+                )
                 completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
                 completion_ids = [None] * len(all_prompts_text)
@@ -565,6 +575,19 @@ class GRPOTrainer(Trainer):
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
+            if self.generation_per_sample > 1:
+                completions_text_with_extra = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+                # Get best of N results
+                bon_sampler = BestOfNSampler(queries_to_scores=self.reward_funcs[0], n_candidates=self.num_generations)
+                bon_results = bon_sampler.select_best(completions_text_with_extra)
+                
+                # Filter completion_ids to only keep the best ones
+                best_indices = [i for i, comp in enumerate(completions_text_with_extra) if comp in bon_results[0]]
+                completion_ids = completion_ids[best_indices]
+                prompt_ids = prompt_ids[best_indices]
+                prompt_mask = prompt_mask[best_indices]
+
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
@@ -590,6 +613,7 @@ class GRPOTrainer(Trainer):
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
         if is_conversational(inputs[0]):
             completions = []
             for prompt, completion in zip(prompts, completions_text):

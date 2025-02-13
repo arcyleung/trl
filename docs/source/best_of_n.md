@@ -18,14 +18,14 @@ ref_model = AutoModelForCausalLMWithValueHead.from_pretrained(ref_model_name)
 reward_pipe = pipeline("sentiment-analysis", model=reward_model, device=device)
 tokenizer = AutoTokenizer.from_pretrained(ref_model_name)
 tokenizer.pad_token = tokenizer.eos_token
-
+output_length_sampler = LengthSampler(64, 128)
 
 # callable that takes a list of raw text and returns a list of corresponding reward scores
 def queries_to_scores(list_of_strings):
   return [output["score"] for output in reward_pipe(list_of_strings)]
 
-best_of_n = BestOfNSampler(model, tokenizer, queries_to_scores, length_sampler=output_length_sampler)
-
+bon_sampler = BestOfNSampler(queries_to_scores)
+samples = bon_sampler.generate(model, tokenizer, max_new_tokens_sampler=output_length_sampler)
 
 ```
 
@@ -36,11 +36,12 @@ And assuming you have a list/tensor of tokenized queries, you can generate bette
 best_of_n.generate(query_tensors, device=device, **gen_kwargs)
 
 ```
-The default sample size is 4, but you can change it at the time of instance initialization like so
+The default sample size is 4, but you can change it at the time of calling `generate()` like so
 
 ```python
 
-best_of_n = BestOfNSampler(model, tokenizer, queries_to_scores, length_sampler=output_length_sampler, sample_size=8)
+best_of_two = BestOfNSampler(queries_to_scores)
+best_of_two.generate(model, query_tensors, device=device, max_new_tokens_sampler=output_length_sampler, generation_config=generation_config)
 
 ```
 
@@ -48,12 +49,12 @@ The default output is the result of taking the top scored output for each query,
 
 ```python
 
-best_of_n = BestOfNSampler(model, tokenizer, queries_to_scores, length_sampler=output_length_sampler, n_candidates=2)
+best_of_two = BestOfNSampler(queries_to_scores, n_candidates=2)
 
 ```
 
-There is the option of setting the generation settings (like `temperature`, `pad_token_id`) at the time of instance creation as opposed to when calling the `generate` method.
-This is done by passing a `GenerationConfig` from the `transformers` library at the time of initialization
+<!-- There is the option of setting the generation settings (like `temperature`, `pad_token_id`) at the time of instance creation as opposed to when calling the `generate` method. -->
+This is done by passing a `GenerationConfig` from the `transformers` library at the time of generation
 
 ```python
 
@@ -61,9 +62,9 @@ from transformers import GenerationConfig
 
 generation_config = GenerationConfig(min_length= -1, top_k=0.0, top_p= 1.0, do_sample= True, pad_token_id=tokenizer.eos_token_id)
 
-best_of_n = BestOfNSampler(model, tokenizer, queries_to_scores, length_sampler=output_length_sampler, generation_config=generation_config)
+best_of_two = BestOfNSampler(queries_to_scores)
 
-best_of_n.generate(query_tensors, device=device)
+best_of_two.generate(model, query_tensors, device=device, max_new_tokens_sampler=output_length_sampler, generation_config=generation_config)
 
 ```
 
