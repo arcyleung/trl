@@ -39,8 +39,10 @@ class BestOfNSampler:
 
     def select_best(
         self,
-        generated_texts: list[list[str]],
-        queries_to_scores_args: Any
+        completions: list[list[str]],
+        completion_ids: list[list[int]],
+        queries_to_scores_args: Any,
+        **select_best_kwargs
     ) -> list[list[str]]:
         r"""
         Select the best candidates from generated texts based on scores
@@ -52,12 +54,12 @@ class BestOfNSampler:
         Returns:
             list[list[str]]: A list of lists of selected texts
         """
-        result = []
-        for samples in generated_texts:
-            scores = torch.tensor(self.queries_to_scores(samples, **queries_to_scores_args))
-            selected = [samples[i] for i in scores.topk(self.n_candidates).indices]
-            result.append(selected)
-        return result
+        # result = []
+        # for samples in completions:
+        scores = torch.tensor(self.queries_to_scores(completions, **queries_to_scores_args))
+        selected = [(completions[i], completion_ids[i], scores[i]) for i in scores.topk(self.n_candidates).indices]
+        # result.append(selected)
+        return selected
 
     @staticmethod
     def generate_samples(
